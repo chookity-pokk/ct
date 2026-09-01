@@ -22,11 +22,8 @@ class MainWindow(Adw.ApplicationWindow):
         # --- CONFIGURATION ---
         self.PROTON_URL = "https://calendar.proton.me/api/calendar/v1/url/YOUR_LINK.ics"
 
-        # Cache paths
         self.app_id = 'org.example.LibremCalendar'
         self.cache_dir = os.path.join(GLib.get_user_cache_dir(), self.app_id)
-        
-        # We now have TWO files: one for Proton, one for local-only events
         self.cache_file = os.path.join(self.cache_dir, 'cached_events.ics')
         self.local_file = os.path.join(self.cache_dir, 'local_events.ics')
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -38,12 +35,10 @@ class MainWindow(Adw.ApplicationWindow):
         header_bar = Adw.HeaderBar()
         toolbar_view.add_top_bar(header_bar)
 
-        # Add Event Button (Left side)
         self.add_button = Gtk.Button(icon_name="list-add-symbolic")
         self.add_button.connect("clicked", self.on_add_clicked)
         header_bar.pack_start(self.add_button)
 
-        # Sync Button (Right side)
         self.sync_button = Gtk.Button(label="Sync")
         self.sync_button.add_css_class("suggested-action")
         self.sync_button.connect("clicked", self.on_sync_clicked)
@@ -66,50 +61,76 @@ class MainWindow(Adw.ApplicationWindow):
 
     # --- ADD EVENT LOGIC (LOCAL ONLY) ---
     def on_add_clicked(self, button):
-        # Create a Libadwaita Message Dialog for input
         dialog = Adw.MessageDialog(
             parent=self, 
             heading="New Local Event", 
-            body="This event will be saved locally. It cannot sync to Proton."
+            body="This event will be saved locally with an exact time."
         )
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("add", "Add Event")
         dialog.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
 
-        # Input fields
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         
+        # 1. Title Input
         title_entry = Gtk.Entry(placeholder_text="Event Title (e.g., Dentist)")
         vbox.append(title_entry)
         
-        date_entry = Gtk.Entry(placeholder_text="Date (YYYY-MM-DD)")
-        # Pre-fill with today's date for convenience
-        date_entry.set_text(datetime.now().strftime("%Y-%m-%d"))
-        vbox.append(date_entry)
+        # 2. GTK Calendar Widget for visual date selection
+        calendar = Gtk.Calendar()
+        vbox.append(calendar)
 
+        # 3. Time Pickers (Hours and Minutes)
+        time_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        time_box.set_halign(Gtk.Align.CENTER)
+        
+        time_label = Gtk.Label(label="Time (24h):")
+        time_box.append(time_label)
+
+        # Hour Selector (0-23)
+        current_hour = datetime.now().hour
+        adj_hour = Gtk.Adjustment(value=current_hour, lower=0, upper=23, step_increment=1)
+        hour_spin = Gtk.SpinButton(adjustment=adj_hour, numeric=True, orientation=Gtk.Orientation.VERTICAL)
+        time_box.append(hour_spin)
+
+        colon_label = Gtk.Label(label=":")
+        time_box.append(colon_label)
+
+        # Minute Selector (0-59)
+        adj_min = Gtk.Adjustment(value=0, lower=0, upper=59, step_increment=5) # 5-minute increments
+        min_spin = Gtk.SpinButton(adjustment=adj_min, numeric=True, orientation=Gtk.Orientation.VERTICAL)
+        time_box.append(min_spin)
+
+        vbox.append(time_box)
         dialog.set_extra_child(vbox)
 
         # Handle the user's response
         def on_response(dialog, response):
             if response == "add":
                 title = title_entry.get_text()
-                date_str = date_entry.get_text()
-                self.save_local_event(title, date_str)
+                
+                # Extract date from GTK4 Calendar (returns a GLib.DateTime)
+                gdate = calendar.get_date()
+                year = gdate.get_year()
+                month = gdate.get_month()
+                day = gdate.get_day_of_month()
+                
+                # Extract time from SpinButtons
+                hour = hour_spin.get_value_as_int()
+                minute = min_spin.get_value_as_int()
+                
+                # Create a timezone-aware datetime object for the local timezone
+                event_dt = datetime(year, month, day, hour, minute).astimezone()
+                
+                self.save_local_event(title, event_dt)
 
         dialog.connect("response", on_response)
         dialog.present()
 
-    def save_local_event(self, title, date_str):
-        if not title or not date_str:
+    def save_local_event(self, title, event_dt):
+        if not title:
             return
 
-        try:
-            event_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-        except ValueError:
-            print("Invalid date format. Use YYYY-MM-DD.")
-            return
-
-        # 1. Load existing local calendar or create a new one
         cal = Calendar()
         if os.path.exists(self.local_file):
             with open(self.local_file, 'rb') as f:
@@ -118,17 +139,15 @@ class MainWindow(Adw.ApplicationWindow):
             cal.add('prodid', '-//Librem Local Calendar//')
             cal.add('version', '2.0')
 
-        # 2. Create the new event
+        # Add the exact datetime to the event
         event = Event()
         event.add('summary', title)
-        event.add('dtstart', event_date)
+        event.add('dtstart', event_dt)
         cal.add_component(event)
 
-        # 3. Save back to the local file
         with open(self.local_file, 'wb') as f:
             f.write(cal.to_ical())
 
-        # 4. Refresh the UI
         self.load_all_events()
 
     # --- DATA FETCHING & CACHING ---
@@ -158,7 +177,6 @@ class MainWindow(Adw.ApplicationWindow):
             with open(self.cache_file, 'wb') as f:
                 f.write(ics_data)
                 
-            # Safely tell the UI thread to refresh everything
             GLib.idle_add(self.load_all_events)
             
         except Exception as e:
@@ -171,7 +189,6 @@ class MainWindow(Adw.ApplicationWindow):
 
     # --- PARSING & UI BUILDING ---
     def load_all_events(self):
-        # Clear existing UI
         while child := self.events_box.get_first_child():
             self.events_box.remove(child)
 
@@ -179,7 +196,6 @@ class MainWindow(Adw.ApplicationWindow):
         today = datetime.now(timezone.utc).date()
         end_date = today + timedelta(days=30)
 
-        # Helper function to parse a specific ics file and add it to our list
         def extract_events_from_file(filepath, is_local=False):
             if not os.path.exists(filepath):
                 return
@@ -198,7 +214,7 @@ class MainWindow(Adw.ApplicationWindow):
                     summary = str(component.get('summary', 'No Title'))
                     
                     if is_local:
-                        summary = f"📱 {summary}" # Visually distinguish local events
+                        summary = f"📱 {summary}"
                     
                     if isinstance(dt, datetime):
                         sort_key = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
@@ -213,14 +229,11 @@ class MainWindow(Adw.ApplicationWindow):
             except Exception as e:
                 print(f"Error reading {filepath}: {e}")
 
-        # Extract from both Proton and Local files
         extract_events_from_file(self.cache_file, is_local=False)
         extract_events_from_file(self.local_file, is_local=True)
 
-        # Sort combined list chronologically
         upcoming_events.sort(key=lambda x: x['sort_key'])
 
-        # Group by Date String
         grouped_events = {}
         for event in upcoming_events:
             dt = event['dt']
@@ -231,7 +244,6 @@ class MainWindow(Adw.ApplicationWindow):
                 grouped_events[date_label] = []
             grouped_events[date_label].append(event)
 
-        # Build the UI
         for date_label, events_on_day in grouped_events.items():
             label = Gtk.Label(label=date_label)
             label.set_halign(Gtk.Align.START)
