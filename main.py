@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import gi
 import urllib.request
 import threading
@@ -26,7 +27,10 @@ class MainWindow(Adw.ApplicationWindow):
         self.cache_dir = os.path.join(GLib.get_user_cache_dir(), self.app_id)
         self.cache_file = os.path.join(self.cache_dir, 'cached_events.ics')
         self.local_file = os.path.join(self.cache_dir, 'local_events.ics')
+        self.completed_file = os.path.join(self.cache_dir, 'completed_ids.json')
         os.makedirs(self.cache_dir, exist_ok=True)
+
+        self.completed_ids = self.load_completed_ids()
 
         # --- UI SETUP ---
         toolbar_view = Adw.ToolbarView()
@@ -35,36 +39,80 @@ class MainWindow(Adw.ApplicationWindow):
         header_bar = Adw.HeaderBar()
         toolbar_view.add_top_bar(header_bar)
 
+        # Add Event Button
         self.add_button = Gtk.Button(icon_name="list-add-symbolic")
         self.add_button.connect("clicked", self.on_add_clicked)
         header_bar.pack_start(self.add_button)
 
+        # Sync Button
         self.sync_button = Gtk.Button(label="Sync")
         self.sync_button.add_css_class("suggested-action")
         self.sync_button.connect("clicked", self.on_sync_clicked)
         header_bar.pack_end(self.sync_button)
 
-        scrolled_window = Gtk.ScrolledWindow(vexpand=True)
-        self.events_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
-        self.events_box.set_margin_top(18)
-        self.events_box.set_margin_bottom(24)
-        self.events_box.set_margin_start(12)
-        self.events_box.set_margin_end(12)
+        # --- TAB NAVIGATION (Adw.ViewStack + Adw.ViewSwitcherBar) ---
+        self.view_stack = Adw.ViewStack()
 
-        scrolled_window.set_child(self.events_box)
-        toolbar_view.set_content(scrolled_window)
+        # 1. Upcoming Tab
+        scrolled_upcoming = Gtk.ScrolledWindow(vexpand=True)
+        self.upcoming_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        self.setup_box_margins(self.upcoming_box)
+        scrolled_upcoming.set_child(self.upcoming_box)
+        
+        page_upcoming = self.view_stack.add_titled(scrolled_upcoming, "upcoming", "Upcoming")
+        page_upcoming.set_icon_name("office-calendar-symbolic")
+
+        # 2. Completed Tab
+        scrolled_completed = Gtk.ScrolledWindow(vexpand=True)
+        self.completed_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        self.setup_box_margins(self.completed_box)
+        scrolled_completed.set_child(self.completed_box)
+
+        page_completed = self.view_stack.add_titled(scrolled_completed, "completed", "Completed")
+        page_completed.set_icon_name("emblem-ok-symbolic")
+
+        toolbar_view.set_content(self.view_stack)
+
+        # Bottom View Switcher Bar (Mobile Friendly)
+        switcher_bar = Adw.ViewSwitcherBar()
+        switcher_bar.set_stack(self.view_stack)
+        switcher_bar.set_reveal(True)
+        toolbar_view.add_bottom_bar(switcher_bar)
 
         # --- STARTUP ROUTINE ---
         self.load_all_events()
         GLib.timeout_add_seconds(3600, self.on_sync_timer_tick)
         self.trigger_sync()
 
-    # --- ADD EVENT LOGIC (LOCAL ONLY) ---
+    def setup_box_margins(self, box):
+        box.set_margin_top(18)
+        box.set_margin_bottom(24)
+        box.set_margin_start(12)
+        box.set_margin_end(12)
+
+    # --- COMPLETION TRACKING (JSON) ---
+    def load_completed_ids(self):
+        if os.path.exists(self.completed_file):
+            try:
+                with open(self.completed_file, 'r') as f:
+                    return set(json.load(f))
+            except Exception as e:
+                print(f"Error loading completed IDs: {e}")
+        return set()
+
+    def save_completed_ids(self):
+        try:
+            with open(self.completed_file, 'w') as f:
+                json.dump(list(self.completed_ids), f)
+        except Exception as e:
+            print(f"Error saving completed IDs: {e}")
+
+    # --- ADD EVENT DIALOG ---
     def on_add_clicked(self, button):
         dialog = Adw.MessageDialog(
             parent=self, 
             heading="New Local Event", 
-            body="This event will be saved locally with an exact time."
+            body="Select date and time for your new event."
         )
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("add", "Add Event")
@@ -72,56 +120,38 @@ class MainWindow(Adw.ApplicationWindow):
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         
-        # 1. Title Input
         title_entry = Gtk.Entry(placeholder_text="Event Title (e.g., Dentist)")
         vbox.append(title_entry)
         
-        # 2. GTK Calendar Widget for visual date selection
         calendar = Gtk.Calendar()
         vbox.append(calendar)
 
-        # 3. Time Pickers (Hours and Minutes)
         time_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         time_box.set_halign(Gtk.Align.CENTER)
-        
-        time_label = Gtk.Label(label="Time (24h):")
-        time_box.append(time_label)
+        time_box.append(Gtk.Label(label="Time (24h):"))
 
-        # Hour Selector (0-23)
         current_hour = datetime.now().hour
         adj_hour = Gtk.Adjustment(value=current_hour, lower=0, upper=23, step_increment=1)
         hour_spin = Gtk.SpinButton(adjustment=adj_hour, numeric=True, orientation=Gtk.Orientation.VERTICAL)
         time_box.append(hour_spin)
 
-        colon_label = Gtk.Label(label=":")
-        time_box.append(colon_label)
+        time_box.append(Gtk.Label(label=":"))
 
-        # Minute Selector (0-59)
-        adj_min = Gtk.Adjustment(value=0, lower=0, upper=59, step_increment=5) # 5-minute increments
+        adj_min = Gtk.Adjustment(value=0, lower=0, upper=59, step_increment=5)
         min_spin = Gtk.SpinButton(adjustment=adj_min, numeric=True, orientation=Gtk.Orientation.VERTICAL)
         time_box.append(min_spin)
 
         vbox.append(time_box)
         dialog.set_extra_child(vbox)
 
-        # Handle the user's response
         def on_response(dialog, response):
             if response == "add":
                 title = title_entry.get_text()
-                
-                # Extract date from GTK4 Calendar (returns a GLib.DateTime)
                 gdate = calendar.get_date()
-                year = gdate.get_year()
-                month = gdate.get_month()
-                day = gdate.get_day_of_month()
+                year, month, day = gdate.get_year(), gdate.get_month(), gdate.get_day_of_month()
+                hour, minute = hour_spin.get_value_as_int(), min_spin.get_value_as_int()
                 
-                # Extract time from SpinButtons
-                hour = hour_spin.get_value_as_int()
-                minute = min_spin.get_value_as_int()
-                
-                # Create a timezone-aware datetime object for the local timezone
                 event_dt = datetime(year, month, day, hour, minute).astimezone()
-                
                 self.save_local_event(title, event_dt)
 
         dialog.connect("response", on_response)
@@ -139,7 +169,6 @@ class MainWindow(Adw.ApplicationWindow):
             cal.add('prodid', '-//Librem Local Calendar//')
             cal.add('version', '2.0')
 
-        # Add the exact datetime to the event
         event = Event()
         event.add('summary', title)
         event.add('dtstart', event_dt)
@@ -150,7 +179,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.load_all_events()
 
-    # --- DATA FETCHING & CACHING ---
+    # --- SYNC LOGIC ---
     def on_sync_clicked(self, button):
         self.trigger_sync()
 
@@ -189,10 +218,12 @@ class MainWindow(Adw.ApplicationWindow):
 
     # --- PARSING & UI BUILDING ---
     def load_all_events(self):
-        while child := self.events_box.get_first_child():
-            self.events_box.remove(child)
+        # Clear both upcoming and completed boxes
+        for box in (self.upcoming_box, self.completed_box):
+            while child := box.get_first_child():
+                box.remove(child)
 
-        upcoming_events = []
+        all_events = []
         today = datetime.now(timezone.utc).date()
         end_date = today + timedelta(days=30)
 
@@ -220,8 +251,12 @@ class MainWindow(Adw.ApplicationWindow):
                         sort_key = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
                     else:
                         sort_key = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
+                    
+                    # Generate a unique ID per event instance
+                    event_id = f"{summary}_{sort_key.isoformat()}"
                         
-                    upcoming_events.append({
+                    all_events.append({
+                        'id': event_id,
                         'summary': summary,
                         'dt': dt,
                         'sort_key': sort_key
@@ -232,19 +267,38 @@ class MainWindow(Adw.ApplicationWindow):
         extract_events_from_file(self.cache_file, is_local=False)
         extract_events_from_file(self.local_file, is_local=True)
 
-        upcoming_events.sort(key=lambda x: x['sort_key'])
+        all_events.sort(key=lambda x: x['sort_key'])
 
-        grouped_events = {}
-        for event in upcoming_events:
+        # Split into upcoming vs completed lists
+        upcoming_list = [e for e in all_events if e['id'] not in self.completed_ids]
+        completed_list = [e for e in all_events if e['id'] in self.completed_ids]
+
+        # Render both tabs
+        self.render_event_group(upcoming_list, self.upcoming_box, is_completed_tab=False)
+        self.render_event_group(completed_list, self.completed_box, is_completed_tab=True)
+
+        self.reset_sync_button()
+
+    def render_event_group(self, events_list, target_box, is_completed_tab=False):
+        if not events_list:
+            empty_label = Gtk.Label(label="No completed events" if is_completed_tab else "No upcoming events")
+            empty_label.add_css_class("dim-label")
+            empty_label.set_margin_top(24)
+            target_box.append(empty_label)
+            return
+
+        # Group by Date String
+        grouped = {}
+        for event in events_list:
             dt = event['dt']
             event_date = dt.date() if isinstance(dt, datetime) else dt
             date_label = event_date.strftime("%A, %B %d")
             
-            if date_label not in grouped_events:
-                grouped_events[date_label] = []
-            grouped_events[date_label].append(event)
+            if date_label not in grouped:
+                grouped[date_label] = []
+            grouped[date_label].append(event)
 
-        for date_label, events_on_day in grouped_events.items():
+        for date_label, events_on_day in grouped.items():
             label = Gtk.Label(label=date_label)
             label.set_halign(Gtk.Align.START)
             label.add_css_class("title-4")
@@ -256,20 +310,31 @@ class MainWindow(Adw.ApplicationWindow):
             
             for event in events_on_day:
                 dt = event['dt']
-                if isinstance(dt, datetime):
-                    time_str = dt.strftime("%H:%M")
-                else:
-                    time_str = "All Day"
+                time_str = dt.strftime("%H:%M") if isinstance(dt, datetime) else "All Day"
                     
                 row = Adw.ActionRow(title=event['summary'], subtitle=time_str)
+                
+                # Add CheckButton Prefix
+                check = Gtk.CheckButton()
+                check.set_active(is_completed_tab)
+                
+                def on_toggle(btn, event_id=event['id']):
+                    if btn.get_active():
+                        self.completed_ids.add(event_id)
+                    else:
+                        self.completed_ids.discard(event_id)
+                    self.save_completed_ids()
+                    self.load_all_events()
+
+                check.connect("toggled", on_toggle)
+                row.add_prefix(check)
                 day_list.append(row)
                 
             section_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             section_box.append(label)
             section_box.append(day_list)
-            self.events_box.append(section_box)
-            
-        self.reset_sync_button()
+            target_box.append(section_box)
+
 
 class CalendarApp(Adw.Application):
     def __init__(self):
