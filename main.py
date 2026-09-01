@@ -20,16 +20,18 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_title("Librem Calendar")
         self.set_default_size(360, 720)
 
-        # --- CONFIGURATION ---
-        self.PROTON_URL = "https://calendar.proton.me/api/calendar/v1/url/YOUR_LINK.ics"
-
+        # --- CACHE & CONFIGURATION PATHS ---
         self.app_id = 'org.example.LibremCalendar'
         self.cache_dir = os.path.join(GLib.get_user_cache_dir(), self.app_id)
+        
         self.cache_file = os.path.join(self.cache_dir, 'cached_events.ics')
         self.local_file = os.path.join(self.cache_dir, 'local_events.ics')
         self.completed_file = os.path.join(self.cache_dir, 'completed_ids.json')
+        self.config_file = os.path.join(self.cache_dir, 'config.json')
         os.makedirs(self.cache_dir, exist_ok=True)
 
+        # Load persisted data
+        self.PROTON_URL = self.load_config()
         self.completed_ids = self.load_completed_ids()
 
         # --- UI SETUP ---
@@ -39,18 +41,23 @@ class MainWindow(Adw.ApplicationWindow):
         header_bar = Adw.HeaderBar()
         toolbar_view.add_top_bar(header_bar)
 
-        # Add Event Button
+        # Left side: Add Event Button
         self.add_button = Gtk.Button(icon_name="list-add-symbolic")
         self.add_button.connect("clicked", self.on_add_clicked)
         header_bar.pack_start(self.add_button)
 
-        # Sync Button
+        # Right side: Sync Button
         self.sync_button = Gtk.Button(label="Sync")
         self.sync_button.add_css_class("suggested-action")
         self.sync_button.connect("clicked", self.on_sync_clicked)
         header_bar.pack_end(self.sync_button)
+        
+        # Right side: Settings Button
+        self.settings_button = Gtk.Button(icon_name="preferences-system-symbolic")
+        self.settings_button.connect("clicked", self.on_settings_clicked)
+        header_bar.pack_end(self.settings_button)
 
-        # --- TAB NAVIGATION (Adw.ViewStack + Adw.ViewSwitcherBar) ---
+        # --- TAB NAVIGATION (Adw.ViewStack) ---
         self.view_stack = Adw.ViewStack()
 
         # 1. Upcoming Tab
@@ -60,7 +67,8 @@ class MainWindow(Adw.ApplicationWindow):
         scrolled_upcoming.set_child(self.upcoming_box)
         
         page_upcoming = self.view_stack.add_titled(scrolled_upcoming, "upcoming", "Upcoming")
-        page_upcoming.set_icon_name("office-calendar-symbolic")
+        # Fixed standard calendar icon
+        page_upcoming.set_icon_name("x-office-calendar-symbolic")
 
         # 2. Completed Tab
         scrolled_completed = Gtk.ScrolledWindow(vexpand=True)
@@ -69,11 +77,12 @@ class MainWindow(Adw.ApplicationWindow):
         scrolled_completed.set_child(self.completed_box)
 
         page_completed = self.view_stack.add_titled(scrolled_completed, "completed", "Completed")
-        page_completed.set_icon_name("emblem-ok-symbolic")
+        # Fixed standard checkmark icon
+        page_completed.set_icon_name("dialog-ok-symbolic")
 
         toolbar_view.set_content(self.view_stack)
 
-        # Bottom View Switcher Bar (Mobile Friendly)
+        # Bottom View Switcher Bar
         switcher_bar = Adw.ViewSwitcherBar()
         switcher_bar.set_stack(self.view_stack)
         switcher_bar.set_reveal(True)
@@ -82,7 +91,8 @@ class MainWindow(Adw.ApplicationWindow):
         # --- STARTUP ROUTINE ---
         self.load_all_events()
         GLib.timeout_add_seconds(3600, self.on_sync_timer_tick)
-        self.trigger_sync()
+        if self.PROTON_URL:
+            self.trigger_sync()
 
     def setup_box_margins(self, box):
         box.set_margin_top(18)
@@ -90,14 +100,31 @@ class MainWindow(Adw.ApplicationWindow):
         box.set_margin_start(12)
         box.set_margin_end(12)
 
-    # --- COMPLETION TRACKING (JSON) ---
+    # --- JSON CONFIGURATION ---
+    def load_config(self):
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, 'r') as f:
+                    data = json.load(f)
+                    return data.get("proton_url", "")
+            except Exception as e:
+                print(f"Error loading config: {e}")
+        return ""
+
+    def save_config(self, url):
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump({"proton_url": url}, f)
+        except Exception as e:
+            print(f"Error saving config: {e}")
+
     def load_completed_ids(self):
         if os.path.exists(self.completed_file):
             try:
                 with open(self.completed_file, 'r') as f:
                     return set(json.load(f))
-            except Exception as e:
-                print(f"Error loading completed IDs: {e}")
+            except Exception:
+                pass
         return set()
 
     def save_completed_ids(self):
@@ -106,6 +133,28 @@ class MainWindow(Adw.ApplicationWindow):
                 json.dump(list(self.completed_ids), f)
         except Exception as e:
             print(f"Error saving completed IDs: {e}")
+
+    # --- SETTINGS DIALOG ---
+    def on_settings_clicked(self, button):
+        # Native Libadwaita Preferences Window
+        pref_window = Adw.PreferencesWindow(parent=self, title="Settings")
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(title="Sync Integration")
+        
+        url_entry = Adw.EntryRow(title="Calendar .ics Link")
+        url_entry.set_text(self.PROTON_URL)
+        
+        # Save the URL immediately when the user types or pastes it
+        def on_text_changed(entry, param):
+            self.PROTON_URL = entry.get_text().strip()
+            self.save_config(self.PROTON_URL)
+            
+        url_entry.connect("notify::text", on_text_changed)
+        
+        group.add(url_entry)
+        page.add(group)
+        pref_window.add(page)
+        pref_window.present()
 
     # --- ADD EVENT DIALOG ---
     def on_add_clicked(self, button):
@@ -158,8 +207,7 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.present()
 
     def save_local_event(self, title, event_dt):
-        if not title:
-            return
+        if not title: return
 
         cal = Calendar()
         if os.path.exists(self.local_file):
@@ -188,8 +236,13 @@ class MainWindow(Adw.ApplicationWindow):
         return True
 
     def trigger_sync(self):
+        if not self.PROTON_URL or not self.PROTON_URL.startswith("http"):
+            print("No valid URL set. Skipping network sync.")
+            return
+
         if not self.sync_button.get_sensitive():
             return 
+            
         self.sync_button.set_sensitive(False)
         self.sync_button.set_label("Syncing...")
         
@@ -218,7 +271,7 @@ class MainWindow(Adw.ApplicationWindow):
 
     # --- PARSING & UI BUILDING ---
     def load_all_events(self):
-        # Clear both upcoming and completed boxes
+        # Clear UI
         for box in (self.upcoming_box, self.completed_box):
             while child := box.get_first_child():
                 box.remove(child)
@@ -228,8 +281,7 @@ class MainWindow(Adw.ApplicationWindow):
         end_date = today + timedelta(days=30)
 
         def extract_events_from_file(filepath, is_local=False):
-            if not os.path.exists(filepath):
-                return
+            if not os.path.exists(filepath): return
                 
             try:
                 with open(filepath, 'rb') as f:
@@ -243,7 +295,6 @@ class MainWindow(Adw.ApplicationWindow):
                         
                     dt = dtstart.dt
                     summary = str(component.get('summary', 'No Title'))
-                    
                     if is_local:
                         summary = f"📱 {summary}"
                     
@@ -252,7 +303,6 @@ class MainWindow(Adw.ApplicationWindow):
                     else:
                         sort_key = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
                     
-                    # Generate a unique ID per event instance
                     event_id = f"{summary}_{sort_key.isoformat()}"
                         
                     all_events.append({
@@ -269,11 +319,9 @@ class MainWindow(Adw.ApplicationWindow):
 
         all_events.sort(key=lambda x: x['sort_key'])
 
-        # Split into upcoming vs completed lists
         upcoming_list = [e for e in all_events if e['id'] not in self.completed_ids]
         completed_list = [e for e in all_events if e['id'] in self.completed_ids]
 
-        # Render both tabs
         self.render_event_group(upcoming_list, self.upcoming_box, is_completed_tab=False)
         self.render_event_group(completed_list, self.completed_box, is_completed_tab=True)
 
@@ -287,7 +335,6 @@ class MainWindow(Adw.ApplicationWindow):
             target_box.append(empty_label)
             return
 
-        # Group by Date String
         grouped = {}
         for event in events_list:
             dt = event['dt']
@@ -314,7 +361,6 @@ class MainWindow(Adw.ApplicationWindow):
                     
                 row = Adw.ActionRow(title=event['summary'], subtitle=time_str)
                 
-                # Add CheckButton Prefix
                 check = Gtk.CheckButton()
                 check.set_active(is_completed_tab)
                 
