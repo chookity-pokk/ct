@@ -78,7 +78,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         page_completed = self.view_stack.add_titled(scrolled_completed, "completed", "Completed")
         # Fixed standard checkmark icon
-        page_completed.set_icon_name("dialog-ok-symbolic")
+        page_completed.set_icon_name("object-select-symbolic")
 
         toolbar_view.set_content(self.view_stack)
 
