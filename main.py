@@ -14,13 +14,12 @@ from gi.repository import Gtk, Adw, Gio, GLib
 from icalendar import Calendar, Event
 import recurring_ical_events
 
-# --- CATEGORY TO ICON MAPPING ---
 CATEGORY_MAP = {
     "Default": "x-office-calendar-symbolic",
-    "Work": "applications-office-symbolic",
+    "Work": "computer-symbolic",
     "Personal": "user-home-symbolic",
     "Social": "system-users-symbolic",
-    "Health": "emblem-favorite-symbolic",
+    "Health": "starred-symbolic",
     "Chores": "view-list-symbolic",
     "Activity": "weather-clear-symbolic",
     "Finance": "accessories-calculator-symbolic"
