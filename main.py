@@ -14,6 +14,20 @@ from gi.repository import Gtk, Adw, Gio, GLib
 from icalendar import Calendar, Event
 import recurring_ical_events
 
+# --- CATEGORY TO ICON MAPPING ---
+CATEGORY_MAP = {
+    "Default": "x-office-calendar-symbolic",
+    "Work": "applications-office-symbolic",
+    "Personal": "user-home-symbolic",
+    "Social": "system-users-symbolic",
+    "Health": "emblem-favorite-symbolic",
+    "Chores": "view-list-symbolic",
+    "Activity": "weather-clear-symbolic",
+    "Finance": "accessories-calculator-symbolic"
+}
+CATEGORIES_LIST = list(CATEGORY_MAP.keys())
+
+
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -67,7 +81,6 @@ class MainWindow(Adw.ApplicationWindow):
         scrolled_upcoming.set_child(self.upcoming_box)
         
         page_upcoming = self.view_stack.add_titled(scrolled_upcoming, "upcoming", "Upcoming")
-        # Fixed standard calendar icon
         page_upcoming.set_icon_name("x-office-calendar-symbolic")
 
         # 2. Completed Tab
@@ -77,7 +90,6 @@ class MainWindow(Adw.ApplicationWindow):
         scrolled_completed.set_child(self.completed_box)
 
         page_completed = self.view_stack.add_titled(scrolled_completed, "completed", "Completed")
-        # Fixed standard checkmark icon
         page_completed.set_icon_name("object-select-symbolic")
 
         toolbar_view.set_content(self.view_stack)
@@ -136,7 +148,6 @@ class MainWindow(Adw.ApplicationWindow):
 
     # --- SETTINGS DIALOG ---
     def on_settings_clicked(self, button):
-        # Native Libadwaita Preferences Window
         pref_window = Adw.PreferencesWindow(parent=self, title="Settings")
         page = Adw.PreferencesPage()
         group = Adw.PreferencesGroup(title="Sync Integration")
@@ -144,7 +155,6 @@ class MainWindow(Adw.ApplicationWindow):
         url_entry = Adw.EntryRow(title="Calendar .ics Link")
         url_entry.set_text(self.PROTON_URL)
         
-        # Save the URL immediately when the user types or pastes it
         def on_text_changed(entry, param):
             self.PROTON_URL = entry.get_text().strip()
             self.save_config(self.PROTON_URL)
@@ -161,7 +171,7 @@ class MainWindow(Adw.ApplicationWindow):
         dialog = Adw.MessageDialog(
             parent=self, 
             heading="New Local Event", 
-            body="Select date and time for your new event."
+            body="Select details for your new event."
         )
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("add", "Add Event")
@@ -169,12 +179,24 @@ class MainWindow(Adw.ApplicationWindow):
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         
+        # Title
         title_entry = Gtk.Entry(placeholder_text="Event Title (e.g., Dentist)")
         vbox.append(title_entry)
         
+        # Category Dropdown
+        category_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        category_box.set_halign(Gtk.Align.CENTER)
+        category_box.append(Gtk.Label(label="Category:"))
+        
+        category_dropdown = Gtk.DropDown.new_from_strings(CATEGORIES_LIST)
+        category_box.append(category_dropdown)
+        vbox.append(category_box)
+
+        # Date Picker
         calendar = Gtk.Calendar()
         vbox.append(calendar)
 
+        # Time Picker
         time_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         time_box.set_halign(Gtk.Align.CENTER)
         time_box.append(Gtk.Label(label="Time (24h):"))
@@ -196,17 +218,22 @@ class MainWindow(Adw.ApplicationWindow):
         def on_response(dialog, response):
             if response == "add":
                 title = title_entry.get_text()
+                
+                # Get the selected category text
+                selected_idx = category_dropdown.get_selected()
+                category_str = CATEGORIES_LIST[selected_idx]
+
                 gdate = calendar.get_date()
                 year, month, day = gdate.get_year(), gdate.get_month(), gdate.get_day_of_month()
                 hour, minute = hour_spin.get_value_as_int(), min_spin.get_value_as_int()
                 
                 event_dt = datetime(year, month, day, hour, minute).astimezone()
-                self.save_local_event(title, event_dt)
+                self.save_local_event(title, event_dt, category_str)
 
         dialog.connect("response", on_response)
         dialog.present()
 
-    def save_local_event(self, title, event_dt):
+    def save_local_event(self, title, event_dt, category_str):
         if not title: return
 
         cal = Calendar()
@@ -220,6 +247,7 @@ class MainWindow(Adw.ApplicationWindow):
         event = Event()
         event.add('summary', title)
         event.add('dtstart', event_dt)
+        event.add('categories', category_str) # Standard iCal property
         cal.add_component(event)
 
         with open(self.local_file, 'wb') as f:
@@ -237,7 +265,6 @@ class MainWindow(Adw.ApplicationWindow):
 
     def trigger_sync(self):
         if not self.PROTON_URL or not self.PROTON_URL.startswith("http"):
-            print("No valid URL set. Skipping network sync.")
             return
 
         if not self.sync_button.get_sensitive():
@@ -271,7 +298,6 @@ class MainWindow(Adw.ApplicationWindow):
 
     # --- PARSING & UI BUILDING ---
     def load_all_events(self):
-        # Clear UI
         for box in (self.upcoming_box, self.completed_box):
             while child := box.get_first_child():
                 box.remove(child)
@@ -298,6 +324,20 @@ class MainWindow(Adw.ApplicationWindow):
                     if is_local:
                         summary = f"📱 {summary}"
                     
+                    # Extract Category
+                    cat_obj = component.get('categories')
+                    category = "Default"
+                    if cat_obj:
+                        try:
+                            # icalendar vCategory returns bytes via to_ical()
+                            cat_str = cat_obj.to_ical().decode('utf-8')
+                            category = cat_str.split(',')[0].strip() # Take the first one
+                        except Exception:
+                            category = str(cat_obj)
+                            
+                    # Ensure category has a mapped icon, otherwise fallback
+                    icon_name = CATEGORY_MAP.get(category, CATEGORY_MAP["Default"])
+
                     if isinstance(dt, datetime):
                         sort_key = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
                     else:
@@ -309,7 +349,8 @@ class MainWindow(Adw.ApplicationWindow):
                         'id': event_id,
                         'summary': summary,
                         'dt': dt,
-                        'sort_key': sort_key
+                        'sort_key': sort_key,
+                        'icon_name': icon_name
                     })
             except Exception as e:
                 print(f"Error reading {filepath}: {e}")
@@ -361,6 +402,9 @@ class MainWindow(Adw.ApplicationWindow):
                     
                 row = Adw.ActionRow(title=event['summary'], subtitle=time_str)
                 
+                # Bundle the Checkbox and Icon together using a horizontal Box
+                prefix_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+                
                 check = Gtk.CheckButton()
                 check.set_active(is_completed_tab)
                 
@@ -373,7 +417,15 @@ class MainWindow(Adw.ApplicationWindow):
                     self.load_all_events()
 
                 check.connect("toggled", on_toggle)
-                row.add_prefix(check)
+                
+                # Load the mapped Category Icon
+                category_icon = Gtk.Image.new_from_icon_name(event['icon_name'])
+                category_icon.add_css_class("dim-label") # Softens the color slightly to match Libadwaita style
+                
+                prefix_box.append(check)
+                prefix_box.append(category_icon)
+                
+                row.add_prefix(prefix_box)
                 day_list.append(row)
                 
             section_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
