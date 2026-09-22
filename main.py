@@ -14,6 +14,7 @@ from gi.repository import Gtk, Adw, Gio, GLib
 from icalendar import Calendar, Event
 import recurring_ical_events
 
+# --- CATEGORY TO ICON MAPPING ---
 CATEGORY_MAP = {
     "Default": "x-office-calendar-symbolic",
     "Work": "computer-symbolic",
@@ -25,6 +26,10 @@ CATEGORY_MAP = {
     "Finance": "accessories-calculator-symbolic"
 }
 CATEGORIES_LIST = list(CATEGORY_MAP.keys())
+
+# --- PAST EVENT FILTER OPTIONS ---
+PAST_FILTER_OPTIONS = ["Last 7 Days", "Last 30 Days", "Last 90 Days", "Last Year", "All Time"]
+PAST_FILTER_DAYS = [7, 30, 90, 365, 3650] # 3650 days (10 years) acts as "All Time"
 
 
 class MainWindow(Adw.ApplicationWindow):
@@ -43,8 +48,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.config_file = os.path.join(self.cache_dir, 'config.json')
         os.makedirs(self.cache_dir, exist_ok=True)
 
-        # Load persisted data
-        self.PROTON_URL = self.load_config()
+        self.PROTON_URL, self.past_days_filter = self.load_config()
         self.completed_ids = self.load_completed_ids()
 
         # --- UI SETUP ---
@@ -54,18 +58,15 @@ class MainWindow(Adw.ApplicationWindow):
         header_bar = Adw.HeaderBar()
         toolbar_view.add_top_bar(header_bar)
 
-        # Left side: Add Event Button
         self.add_button = Gtk.Button(icon_name="list-add-symbolic")
         self.add_button.connect("clicked", self.on_add_clicked)
         header_bar.pack_start(self.add_button)
 
-        # Right side: Sync Button
         self.sync_button = Gtk.Button(label="Sync")
         self.sync_button.add_css_class("suggested-action")
         self.sync_button.connect("clicked", self.on_sync_clicked)
         header_bar.pack_end(self.sync_button)
         
-        # Right side: Settings Button
         self.settings_button = Gtk.Button(icon_name="preferences-system-symbolic")
         self.settings_button.connect("clicked", self.on_settings_clicked)
         header_bar.pack_end(self.settings_button)
@@ -73,7 +74,16 @@ class MainWindow(Adw.ApplicationWindow):
         # --- TAB NAVIGATION (Adw.ViewStack) ---
         self.view_stack = Adw.ViewStack()
 
-        # 1. Upcoming Tab
+        # 1. Past Tab
+        scrolled_past = Gtk.ScrolledWindow(vexpand=True)
+        self.past_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        self.setup_box_margins(self.past_box)
+        scrolled_past.set_child(self.past_box)
+        
+        page_past = self.view_stack.add_titled(scrolled_past, "past", "Past")
+        page_past.set_icon_name("document-open-recent-symbolic")
+
+        # 2. Upcoming Tab
         scrolled_upcoming = Gtk.ScrolledWindow(vexpand=True)
         self.upcoming_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         self.setup_box_margins(self.upcoming_box)
@@ -82,7 +92,7 @@ class MainWindow(Adw.ApplicationWindow):
         page_upcoming = self.view_stack.add_titled(scrolled_upcoming, "upcoming", "Upcoming")
         page_upcoming.set_icon_name("x-office-calendar-symbolic")
 
-        # 2. Completed Tab
+        # 3. Completed Tab
         scrolled_completed = Gtk.ScrolledWindow(vexpand=True)
         self.completed_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         self.setup_box_margins(self.completed_box)
@@ -98,6 +108,8 @@ class MainWindow(Adw.ApplicationWindow):
         switcher_bar.set_stack(self.view_stack)
         switcher_bar.set_reveal(True)
         toolbar_view.add_bottom_bar(switcher_bar)
+        
+        self.view_stack.set_visible_child_name("upcoming")
 
         # --- STARTUP ROUTINE ---
         self.load_all_events()
@@ -117,15 +129,19 @@ class MainWindow(Adw.ApplicationWindow):
             try:
                 with open(self.config_file, 'r') as f:
                     data = json.load(f)
-                    return data.get("proton_url", "")
+                    # Return URL and the days filter (default to 30 if missing)
+                    return data.get("proton_url", ""), data.get("past_days_filter", 30)
             except Exception as e:
                 print(f"Error loading config: {e}")
-        return ""
+        return "", 30
 
-    def save_config(self, url):
+    def save_config(self):
         try:
             with open(self.config_file, 'w') as f:
-                json.dump({"proton_url": url}, f)
+                json.dump({
+                    "proton_url": self.PROTON_URL,
+                    "past_days_filter": self.past_days_filter
+                }, f)
         except Exception as e:
             print(f"Error saving config: {e}")
 
@@ -149,19 +165,48 @@ class MainWindow(Adw.ApplicationWindow):
     def on_settings_clicked(self, button):
         pref_window = Adw.PreferencesWindow(parent=self, title="Settings")
         page = Adw.PreferencesPage()
-        group = Adw.PreferencesGroup(title="Sync Integration")
         
+        # Sync Group
+        sync_group = Adw.PreferencesGroup(title="Sync Integration")
         url_entry = Adw.EntryRow(title="Calendar .ics Link")
         url_entry.set_text(self.PROTON_URL)
         
         def on_text_changed(entry, param):
             self.PROTON_URL = entry.get_text().strip()
-            self.save_config(self.PROTON_URL)
+            self.save_config()
             
         url_entry.connect("notify::text", on_text_changed)
+        sync_group.add(url_entry)
+        page.add(sync_group)
+
+        # Display Options Group
+        display_group = Adw.PreferencesGroup(title="Display Options")
         
-        group.add(url_entry)
-        page.add(group)
+        # ComboRow for selecting how far back to look
+        filter_row = Adw.ComboRow(title="Show Past Events")
+        
+        # Populate the dropdown with our predefined string options
+        model = Gtk.StringList.new(PAST_FILTER_OPTIONS)
+        filter_row.set_model(model)
+        
+        # Set the initially selected item based on current config
+        try:
+            current_idx = PAST_FILTER_DAYS.index(self.past_days_filter)
+        except ValueError:
+            current_idx = 1 # Fallback to 30 days if somehow invalid
+        filter_row.set_selected(current_idx)
+
+        # Handle the user changing the dropdown
+        def on_filter_changed(combo, param):
+            idx = combo.get_selected()
+            self.past_days_filter = PAST_FILTER_DAYS[idx]
+            self.save_config()
+            self.load_all_events() # Instantly rebuild the UI with the new date range
+
+        filter_row.connect("notify::selected", on_filter_changed)
+        display_group.add(filter_row)
+        page.add(display_group)
+
         pref_window.add(page)
         pref_window.present()
 
@@ -178,11 +223,9 @@ class MainWindow(Adw.ApplicationWindow):
 
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         
-        # Title
         title_entry = Gtk.Entry(placeholder_text="Event Title (e.g., Dentist)")
         vbox.append(title_entry)
         
-        # Category Dropdown
         category_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         category_box.set_halign(Gtk.Align.CENTER)
         category_box.append(Gtk.Label(label="Category:"))
@@ -191,11 +234,9 @@ class MainWindow(Adw.ApplicationWindow):
         category_box.append(category_dropdown)
         vbox.append(category_box)
 
-        # Date Picker
         calendar = Gtk.Calendar()
         vbox.append(calendar)
 
-        # Time Picker
         time_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         time_box.set_halign(Gtk.Align.CENTER)
         time_box.append(Gtk.Label(label="Time (24h):"))
@@ -217,8 +258,6 @@ class MainWindow(Adw.ApplicationWindow):
         def on_response(dialog, response):
             if response == "add":
                 title = title_entry.get_text()
-                
-                # Get the selected category text
                 selected_idx = category_dropdown.get_selected()
                 category_str = CATEGORIES_LIST[selected_idx]
 
@@ -246,7 +285,7 @@ class MainWindow(Adw.ApplicationWindow):
         event = Event()
         event.add('summary', title)
         event.add('dtstart', event_dt)
-        event.add('categories', category_str) # Standard iCal property
+        event.add('categories', category_str) 
         cal.add_component(event)
 
         with open(self.local_file, 'wb') as f:
@@ -297,13 +336,19 @@ class MainWindow(Adw.ApplicationWindow):
 
     # --- PARSING & UI BUILDING ---
     def load_all_events(self):
-        for box in (self.upcoming_box, self.completed_box):
+        for box in (self.past_box, self.upcoming_box, self.completed_box):
             while child := box.get_first_child():
                 box.remove(child)
 
         all_events = []
-        today = datetime.now(timezone.utc).date()
-        end_date = today + timedelta(days=30)
+        now_utc = datetime.now(timezone.utc)
+        today_date = now_utc.date()
+        
+        # Generate the start_date dynamically based on your settings filter!
+        start_date = today_date - timedelta(days=self.past_days_filter)
+        
+        # We also widen the future window so you can see events up to a year out
+        end_date = today_date + timedelta(days=365)
 
         def extract_events_from_file(filepath, is_local=False):
             if not os.path.exists(filepath): return
@@ -312,7 +357,7 @@ class MainWindow(Adw.ApplicationWindow):
                 with open(filepath, 'rb') as f:
                     cal = Calendar.from_ical(f.read())
                     
-                events = recurring_ical_events.of(cal).between(today, end_date)
+                events = recurring_ical_events.of(cal).between(start_date, end_date)
                 
                 for component in events:
                     dtstart = component.get('dtstart')
@@ -323,18 +368,15 @@ class MainWindow(Adw.ApplicationWindow):
                     if is_local:
                         summary = f"📱 {summary}"
                     
-                    # Extract Category
                     cat_obj = component.get('categories')
                     category = "Default"
                     if cat_obj:
                         try:
-                            # icalendar vCategory returns bytes via to_ical()
                             cat_str = cat_obj.to_ical().decode('utf-8')
-                            category = cat_str.split(',')[0].strip() # Take the first one
+                            category = cat_str.split(',')[0].strip()
                         except Exception:
                             category = str(cat_obj)
                             
-                    # Ensure category has a mapped icon, otherwise fallback
                     icon_name = CATEGORY_MAP.get(category, CATEGORY_MAP["Default"])
 
                     if isinstance(dt, datetime):
@@ -359,17 +401,36 @@ class MainWindow(Adw.ApplicationWindow):
 
         all_events.sort(key=lambda x: x['sort_key'])
 
-        upcoming_list = [e for e in all_events if e['id'] not in self.completed_ids]
-        completed_list = [e for e in all_events if e['id'] in self.completed_ids]
+        # --- SORTING INTO TABS ---
+        past_list = []
+        upcoming_list = []
+        completed_list = []
 
-        self.render_event_group(upcoming_list, self.upcoming_box, is_completed_tab=False)
-        self.render_event_group(completed_list, self.completed_box, is_completed_tab=True)
+        for e in all_events:
+            if e['id'] in self.completed_ids:
+                completed_list.append(e)
+            else:
+                dt = e['dt']
+                if isinstance(dt, datetime):
+                    event_time = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                    is_past = event_time < now_utc
+                else:
+                    is_past = dt < today_date
+                
+                if is_past:
+                    past_list.append(e)
+                else:
+                    upcoming_list.append(e)
+
+        self.render_event_group(past_list, self.past_box, empty_msg="No past uncompleted events", is_completed_tab=False)
+        self.render_event_group(upcoming_list, self.upcoming_box, empty_msg="No upcoming events", is_completed_tab=False)
+        self.render_event_group(completed_list, self.completed_box, empty_msg="No completed events", is_completed_tab=True)
 
         self.reset_sync_button()
 
-    def render_event_group(self, events_list, target_box, is_completed_tab=False):
+    def render_event_group(self, events_list, target_box, empty_msg, is_completed_tab=False):
         if not events_list:
-            empty_label = Gtk.Label(label="No completed events" if is_completed_tab else "No upcoming events")
+            empty_label = Gtk.Label(label=empty_msg)
             empty_label.add_css_class("dim-label")
             empty_label.set_margin_top(24)
             target_box.append(empty_label)
@@ -401,7 +462,6 @@ class MainWindow(Adw.ApplicationWindow):
                     
                 row = Adw.ActionRow(title=event['summary'], subtitle=time_str)
                 
-                # Bundle the Checkbox and Icon together using a horizontal Box
                 prefix_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
                 
                 check = Gtk.CheckButton()
@@ -417,9 +477,8 @@ class MainWindow(Adw.ApplicationWindow):
 
                 check.connect("toggled", on_toggle)
                 
-                # Load the mapped Category Icon
                 category_icon = Gtk.Image.new_from_icon_name(event['icon_name'])
-                category_icon.add_css_class("dim-label") # Softens the color slightly to match Libadwaita style
+                category_icon.add_css_class("dim-label") 
                 
                 prefix_box.append(check)
                 prefix_box.append(category_icon)
