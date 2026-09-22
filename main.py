@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import uuid
 import gi
 import urllib.request
 import threading
@@ -27,6 +28,16 @@ CATEGORY_MAP = {
 }
 CATEGORIES_LIST = list(CATEGORY_MAP.keys())
 
+# --- RECURRENCE MAPPING ---
+RECURRENCE_OPTIONS = ["None", "Daily", "Weekly", "Monthly", "Yearly"]
+FREQ_MAP = {
+    "None": None,
+    "Daily": "DAILY",
+    "Weekly": "WEEKLY",
+    "Monthly": "MONTHLY",
+    "Yearly": "YEARLY"
+}
+
 # --- PAST EVENT FILTER OPTIONS ---
 PAST_FILTER_OPTIONS = ["Last 7 Days", "Last 30 Days", "Last 90 Days", "Last Year", "All Time"]
 PAST_FILTER_DAYS = [7, 30, 90, 365, 3650] 
@@ -37,36 +48,29 @@ class EventEditorWindow(Adw.Window):
     def __init__(self, parent, event=None, on_save_cb=None, on_delete_cb=None, **kwargs):
         super().__init__(parent=parent, modal=True, **kwargs)
         self.set_default_size(360, 720)
-        
-        # Force the window to take up the full screen on Phosh
         self.maximize()
 
         self.event = event
         self.on_save_cb = on_save_cb
         self.on_delete_cb = on_delete_cb
 
-        # Setup Header and Toolbar
         toolbar_view = Adw.ToolbarView()
         self.set_content(toolbar_view)
 
         header_bar = Adw.HeaderBar()
         toolbar_view.add_top_bar(header_bar)
         
-        # Native window title
         self.set_title("New Event" if not event else "Edit Event")
 
-        # Cancel Button
         cancel_btn = Gtk.Button(label="Cancel")
         cancel_btn.connect("clicked", self.on_cancel)
         header_bar.pack_start(cancel_btn)
 
-        # Save Button
         save_btn = Gtk.Button(label="Save")
         save_btn.add_css_class("suggested-action")
         save_btn.connect("clicked", self.on_save)
         header_bar.pack_end(save_btn)
 
-        # Main Scrollable Content Area
         scrolled_window = Gtk.ScrolledWindow(vexpand=True)
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         vbox.set_margin_top(24)
@@ -89,13 +93,22 @@ class EventEditorWindow(Adw.Window):
         self.category_dropdown = Gtk.DropDown.new_from_strings(CATEGORIES_LIST)
         category_box.append(self.category_dropdown)
         vbox.append(category_box)
+        
+        # 3. Recurrence Dropdown
+        recur_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        recur_box.set_halign(Gtk.Align.CENTER)
+        recur_box.append(Gtk.Label(label="Repeats:"))
+        
+        self.recur_dropdown = Gtk.DropDown.new_from_strings(RECURRENCE_OPTIONS)
+        recur_box.append(self.recur_dropdown)
+        vbox.append(recur_box)
 
-        # 3. Native Calendar Widget
+        # 4. Native Calendar Widget
         self.calendar = Gtk.Calendar()
         self.calendar.set_halign(Gtk.Align.CENTER)
         vbox.append(self.calendar)
 
-        # 4. Time Pickers
+        # 5. Time Pickers
         time_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         time_box.set_halign(Gtk.Align.CENTER)
         time_box.append(Gtk.Label(label="Time (24h):"))
@@ -112,35 +125,38 @@ class EventEditorWindow(Adw.Window):
 
         vbox.append(time_box)
 
-        # 5. Populate Data (If Editing)
+        # Populate Data (If Editing)
         if event:
             self.title_entry.set_text(event['summary_original'])
+            
             try:
                 idx = CATEGORIES_LIST.index(event['category_raw'])
             except ValueError:
                 idx = 0
             self.category_dropdown.set_selected(idx)
+            
+            try:
+                idx_recur = RECURRENCE_OPTIONS.index(event['freq_raw'])
+            except ValueError:
+                idx_recur = 0
+            self.recur_dropdown.set_selected(idx_recur)
 
             dt_orig = event['dt_original']
             local_dt = dt_orig.astimezone() if isinstance(dt_orig, datetime) and dt_orig.tzinfo else dt_orig
             
-            # Set the calendar date
             gdate = GLib.DateTime.new_local(local_dt.year, local_dt.month, local_dt.day, 0, 0, 0)
             self.calendar.select_day(gdate)
             
-            # Set the time
             if isinstance(dt_orig, datetime):
                 self.adj_hour.set_value(local_dt.hour)
                 self.adj_min.set_value(local_dt.minute)
 
-            # Destructive Delete Button
-            delete_btn = Gtk.Button(label="Delete Event")
+            delete_btn = Gtk.Button(label="Delete Series" if event['freq_raw'] != "None" else "Delete Event")
             delete_btn.add_css_class("destructive-action")
             delete_btn.set_margin_top(24)
             delete_btn.connect("clicked", self.on_delete)
             vbox.append(delete_btn)
         else:
-            # Default to current hour for new events
             self.adj_hour.set_value(datetime.now().hour)
 
     def on_cancel(self, button):
@@ -154,17 +170,17 @@ class EventEditorWindow(Adw.Window):
     def on_save(self, button):
         title = self.title_entry.get_text()
         category = CATEGORIES_LIST[self.category_dropdown.get_selected()]
+        recur_str = RECURRENCE_OPTIONS[self.recur_dropdown.get_selected()]
 
         gdate = self.calendar.get_date()
         year, month, day = gdate.get_year(), gdate.get_month(), gdate.get_day_of_month()
         hour, minute = self.hour_spin.get_value_as_int(), self.min_spin.get_value_as_int()
         
-        # Apply standard timezone conversion logic
         local_dt = datetime(year, month, day, hour, minute)
         utc_dt = local_dt.astimezone(timezone.utc)
         
         if self.on_save_cb:
-            self.on_save_cb(self.event, title, utc_dt, category)
+            self.on_save_cb(self.event, title, utc_dt, category, recur_str)
         self.close()
 
 
@@ -175,10 +191,8 @@ class MainWindow(Adw.ApplicationWindow):
         self.set_title("Librem Calendar")
         self.set_default_size(360, 720)
 
-        # --- STATE VARIABLES ---
         self.all_parsed_events = []
 
-        # --- CACHE & CONFIGURATION PATHS ---
         self.app_id = 'org.example.LibremCalendar'
         self.cache_dir = os.path.join(GLib.get_user_cache_dir(), self.app_id)
         
@@ -191,7 +205,6 @@ class MainWindow(Adw.ApplicationWindow):
         self.PROTON_URL, self.past_days_filter = self.load_config()
         self.completed_ids = self.load_completed_ids()
 
-        # --- UI SETUP ---
         toolbar_view = Adw.ToolbarView()
         self.set_content(toolbar_view)
 
@@ -211,7 +224,6 @@ class MainWindow(Adw.ApplicationWindow):
         self.settings_button.connect("clicked", self.on_settings_clicked)
         header_bar.pack_end(self.settings_button)
 
-        # --- TAB NAVIGATION (Adw.ViewStack) ---
         self.view_stack = Adw.ViewStack()
 
         # 1. Past Tab
@@ -219,7 +231,6 @@ class MainWindow(Adw.ApplicationWindow):
         self.past_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         self.setup_box_margins(self.past_box)
         scrolled_past.set_child(self.past_box)
-        
         page_past = self.view_stack.add_titled(scrolled_past, "past", "Past")
         page_past.set_icon_name("document-open-recent-symbolic")
 
@@ -228,7 +239,6 @@ class MainWindow(Adw.ApplicationWindow):
         self.upcoming_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         self.setup_box_margins(self.upcoming_box)
         scrolled_upcoming.set_child(self.upcoming_box)
-        
         page_upcoming = self.view_stack.add_titled(scrolled_upcoming, "upcoming", "Upcoming")
         page_upcoming.set_icon_name("x-office-calendar-symbolic")
 
@@ -237,13 +247,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.completed_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
         self.setup_box_margins(self.completed_box)
         scrolled_completed.set_child(self.completed_box)
-
         page_completed = self.view_stack.add_titled(scrolled_completed, "completed", "Completed")
         page_completed.set_icon_name("object-select-symbolic")
 
         toolbar_view.set_content(self.view_stack)
 
-        # Bottom View Switcher Bar
         switcher_bar = Adw.ViewSwitcherBar()
         switcher_bar.set_stack(self.view_stack)
         switcher_bar.set_reveal(True)
@@ -251,7 +259,6 @@ class MainWindow(Adw.ApplicationWindow):
         
         self.view_stack.set_visible_child_name("upcoming")
 
-        # --- STARTUP ROUTINE ---
         self.load_all_events()
         GLib.timeout_add_seconds(3600, self.on_sync_timer_tick)
         if self.PROTON_URL:
@@ -263,7 +270,6 @@ class MainWindow(Adw.ApplicationWindow):
         box.set_margin_start(12)
         box.set_margin_end(12)
 
-    # --- JSON CONFIGURATION ---
     def load_config(self):
         if os.path.exists(self.config_file):
             try:
@@ -300,7 +306,6 @@ class MainWindow(Adw.ApplicationWindow):
         except Exception as e:
             print(f"Error saving completed IDs: {e}")
 
-    # --- SETTINGS DIALOG ---
     def on_settings_clicked(self, button):
         pref_window = Adw.PreferencesWindow(parent=self, title="Settings")
         page = Adw.PreferencesPage()
@@ -341,7 +346,6 @@ class MainWindow(Adw.ApplicationWindow):
         pref_window.add(page)
         pref_window.present()
 
-    # --- NEW: FULL-SCREEN ROUTING ---
     def on_add_clicked(self, button):
         editor = EventEditorWindow(parent=self, event=None, on_save_cb=self.save_or_update_event)
         editor.present()
@@ -363,19 +367,18 @@ class MainWindow(Adw.ApplicationWindow):
         editor = EventEditorWindow(parent=self, event=event, on_save_cb=self.save_or_update_event, on_delete_cb=self.delete_event)
         editor.present()
 
-    # --- EVENT DATA MANAGEMENT ---
-    def save_or_update_event(self, old_event, title, dt, category):
+    def save_or_update_event(self, old_event, title, dt, category, recur_str):
         if not title: return
 
         if old_event:
-            self.update_local_event(old_event, new_title=title, new_dt=dt, new_category=category, delete=False)
+            self.update_local_event(old_event, new_title=title, new_dt=dt, new_category=category, new_recur=recur_str, delete=False)
         else:
-            self.save_local_event(title, dt, category)
+            self.save_local_event(title, dt, category, recur_str)
 
     def delete_event(self, old_event):
         self.update_local_event(old_event, delete=True)
 
-    def save_local_event(self, title, event_dt, category_str):
+    def save_local_event(self, title, event_dt, category_str, recur_str):
         cal = Calendar()
         if os.path.exists(self.local_file):
             with open(self.local_file, 'rb') as f:
@@ -385,9 +388,16 @@ class MainWindow(Adw.ApplicationWindow):
             cal.add('version', '2.0')
 
         event = Event()
+        # Add a Universal ID so we can track this event across all its recurrences
+        event.add('uid', str(uuid.uuid4()) + '@librem.local')
         event.add('summary', title)
         event.add('dtstart', event_dt) 
         event.add('categories', category_str) 
+        
+        freq = FREQ_MAP.get(recur_str)
+        if freq:
+            event.add('rrule', {'freq': freq})
+            
         cal.add_component(event)
 
         with open(self.local_file, 'wb') as f:
@@ -395,7 +405,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         self.load_all_events()
 
-    def update_local_event(self, old_event, new_title=None, new_dt=None, new_category=None, delete=False):
+    def update_local_event(self, old_event, new_title=None, new_dt=None, new_category=None, new_recur=None, delete=False):
         if not os.path.exists(self.local_file):
             return
             
@@ -404,13 +414,23 @@ class MainWindow(Adw.ApplicationWindow):
                 cal = Calendar.from_ical(f.read())
                 
             found_idx = -1
+            old_uid = old_event.get('uid')
+            
             for i, component in enumerate(cal.subcomponents):
                 if component.name == 'VEVENT':
-                    c_summary = str(component.get('summary', ''))
-                    c_dtstart = component.get('dtstart')
-                    if c_dtstart and c_dtstart.dt == old_event['dt_original'] and c_summary == old_event['summary_original']:
+                    c_uid = str(component.get('uid', ''))
+                    
+                    # Search by exact UID first (New standard)
+                    if old_uid and c_uid == old_uid:
                         found_idx = i
                         break
+                    # Fallback to fuzzy searching for events created before this update
+                    elif not old_uid:
+                        c_summary = str(component.get('summary', ''))
+                        c_dtstart = component.get('dtstart')
+                        if c_dtstart and c_dtstart.dt == old_event['dt_original'] and c_summary == old_event['summary_original']:
+                            found_idx = i
+                            break
                         
             if found_idx != -1:
                 if delete:
@@ -421,10 +441,16 @@ class MainWindow(Adw.ApplicationWindow):
                     del comp['dtstart']
                     if 'categories' in comp:
                         del comp['categories']
+                    if 'rrule' in comp:
+                        del comp['rrule']
                         
                     comp.add('summary', new_title)
                     comp.add('dtstart', new_dt)
                     comp.add('categories', new_category)
+                    
+                    freq = FREQ_MAP.get(new_recur)
+                    if freq:
+                        comp.add('rrule', {'freq': freq})
                     
                 with open(self.local_file, 'wb') as f:
                     f.write(cal.to_ical())
@@ -434,8 +460,6 @@ class MainWindow(Adw.ApplicationWindow):
         except Exception as e:
             print(f"Error updating local event: {e}")
 
-
-    # --- SYNC LOGIC ---
     def on_sync_clicked(self, button):
         self.trigger_sync()
 
@@ -476,7 +500,6 @@ class MainWindow(Adw.ApplicationWindow):
         self.sync_button.set_sensitive(True)
         self.sync_button.set_label("Sync")
 
-    # --- PARSING & UI BUILDING ---
     def load_all_events(self):
         self.all_parsed_events = []
         now_utc = datetime.now(timezone.utc)
@@ -500,6 +523,7 @@ class MainWindow(Adw.ApplicationWindow):
                         
                     dt_original = dtstart.dt
                     summary_original = str(component.get('summary', 'No Title'))
+                    uid = str(component.get('uid', ''))
                     
                     summary = summary_original
                     if is_local:
@@ -515,6 +539,16 @@ class MainWindow(Adw.ApplicationWindow):
                             category = str(cat_obj)
                             
                     icon_name = CATEGORY_MAP.get(category, CATEGORY_MAP["Default"])
+                    
+                    # Extract RRULE for the editor dropdown
+                    freq_raw = "None"
+                    rrule = component.get('rrule')
+                    if rrule and 'FREQ' in rrule:
+                        freq_val = rrule['FREQ'][0] if isinstance(rrule['FREQ'], list) else rrule['FREQ']
+                        for k, v in FREQ_MAP.items():
+                            if v == freq_val:
+                                freq_raw = k
+                                break
 
                     if isinstance(dt_original, datetime):
                         sort_key = dt_original if dt_original.tzinfo else dt_original.astimezone(timezone.utc)
@@ -525,6 +559,7 @@ class MainWindow(Adw.ApplicationWindow):
                         
                     self.all_parsed_events.append({
                         'id': event_id,
+                        'uid': uid,
                         'summary': summary,
                         'summary_original': summary_original, 
                         'dt': dt_original,
@@ -532,6 +567,7 @@ class MainWindow(Adw.ApplicationWindow):
                         'sort_key': sort_key,
                         'icon_name': icon_name,
                         'category_raw': category,
+                        'freq_raw': freq_raw,
                         'is_local': is_local                  
                     })
             except Exception as e:
@@ -557,6 +593,8 @@ class MainWindow(Adw.ApplicationWindow):
         completed_list = []
 
         for e in self.all_parsed_events:
+            # We track completion by the unique combination of name + EXACT timestamp.
+            # This elegantly allows you to "Complete" a single day of a recurring event!
             if e['id'] in self.completed_ids:
                 completed_list.append(e)
             else:
@@ -640,6 +678,11 @@ class MainWindow(Adw.ApplicationWindow):
                 
                 category_icon = Gtk.Image.new_from_icon_name(event['icon_name'])
                 category_icon.add_css_class("dim-label") 
+                
+                if event['freq_raw'] != "None":
+                    recur_icon = Gtk.Image.new_from_icon_name("view-refresh-symbolic")
+                    recur_icon.add_css_class("dim-label")
+                    prefix_box.append(recur_icon)
                 
                 prefix_box.append(check)
                 prefix_box.append(category_icon)
