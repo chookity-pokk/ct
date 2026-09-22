@@ -29,7 +29,7 @@ CATEGORIES_LIST = list(CATEGORY_MAP.keys())
 
 # --- PAST EVENT FILTER OPTIONS ---
 PAST_FILTER_OPTIONS = ["Last 7 Days", "Last 30 Days", "Last 90 Days", "Last Year", "All Time"]
-PAST_FILTER_DAYS = [7, 30, 90, 365, 3650] # 3650 days (10 years) acts as "All Time"
+PAST_FILTER_DAYS = [7, 30, 90, 365, 3650] 
 
 
 class MainWindow(Adw.ApplicationWindow):
@@ -37,6 +37,10 @@ class MainWindow(Adw.ApplicationWindow):
         super().__init__(**kwargs)
         self.set_title("Librem Calendar")
         self.set_default_size(360, 720)
+
+        # --- STATE VARIABLES ---
+        self.all_parsed_events = []
+        self.current_search_query = ""
 
         # --- CACHE & CONFIGURATION PATHS ---
         self.app_id = 'org.example.LibremCalendar'
@@ -58,18 +62,45 @@ class MainWindow(Adw.ApplicationWindow):
         header_bar = Adw.HeaderBar()
         toolbar_view.add_top_bar(header_bar)
 
+        # Left side: Add Event Button
         self.add_button = Gtk.Button(icon_name="list-add-symbolic")
         self.add_button.connect("clicked", self.on_add_clicked)
         header_bar.pack_start(self.add_button)
 
+        # Left side: Search Toggle Button
+        self.search_toggle = Gtk.ToggleButton(icon_name="system-search-symbolic")
+        header_bar.pack_start(self.search_toggle)
+
+        # Right side: Sync Button
         self.sync_button = Gtk.Button(label="Sync")
         self.sync_button.add_css_class("suggested-action")
         self.sync_button.connect("clicked", self.on_sync_clicked)
         header_bar.pack_end(self.sync_button)
         
+        # Right side: Settings Button
         self.settings_button = Gtk.Button(icon_name="preferences-system-symbolic")
         self.settings_button.connect("clicked", self.on_settings_clicked)
         header_bar.pack_end(self.settings_button)
+
+        # --- SEARCH BAR SETUP ---
+        self.search_bar = Adw.SearchBar()
+        self.search_entry = Gtk.SearchEntry()
+        self.search_bar.set_child(self.search_entry)
+        self.search_bar.connect_entry(self.search_entry)
+        
+        # Bind the search bar visibility to the toggle button
+        self.search_bar.bind_property(
+            "search-mode-enabled", 
+            self.search_toggle, 
+            "active", 
+            Gio.BindingFlags.BIDIRECTIONAL | Gio.BindingFlags.SYNC_CREATE
+        )
+        
+        # Trigger UI refresh instantly when typing
+        self.search_entry.connect("search-changed", self.on_search_changed)
+        
+        # Add the search bar as a secondary top bar under the header
+        toolbar_view.add_top_bar(self.search_bar)
 
         # --- TAB NAVIGATION (Adw.ViewStack) ---
         self.view_stack = Adw.ViewStack()
@@ -129,7 +160,6 @@ class MainWindow(Adw.ApplicationWindow):
             try:
                 with open(self.config_file, 'r') as f:
                     data = json.load(f)
-                    # Return URL and the days filter (default to 30 if missing)
                     return data.get("proton_url", ""), data.get("past_days_filter", 30)
             except Exception as e:
                 print(f"Error loading config: {e}")
@@ -161,12 +191,17 @@ class MainWindow(Adw.ApplicationWindow):
         except Exception as e:
             print(f"Error saving completed IDs: {e}")
 
+    # --- SEARCH LOGIC ---
+    def on_search_changed(self, entry):
+        # Save query in lowercase for case-insensitive matching
+        self.current_search_query = entry.get_text().strip().lower()
+        self.refresh_ui()
+
     # --- SETTINGS DIALOG ---
     def on_settings_clicked(self, button):
         pref_window = Adw.PreferencesWindow(parent=self, title="Settings")
         page = Adw.PreferencesPage()
         
-        # Sync Group
         sync_group = Adw.PreferencesGroup(title="Sync Integration")
         url_entry = Adw.EntryRow(title="Calendar .ics Link")
         url_entry.set_text(self.PROTON_URL)
@@ -179,29 +214,22 @@ class MainWindow(Adw.ApplicationWindow):
         sync_group.add(url_entry)
         page.add(sync_group)
 
-        # Display Options Group
         display_group = Adw.PreferencesGroup(title="Display Options")
-        
-        # ComboRow for selecting how far back to look
         filter_row = Adw.ComboRow(title="Show Past Events")
-        
-        # Populate the dropdown with our predefined string options
         model = Gtk.StringList.new(PAST_FILTER_OPTIONS)
         filter_row.set_model(model)
         
-        # Set the initially selected item based on current config
         try:
             current_idx = PAST_FILTER_DAYS.index(self.past_days_filter)
         except ValueError:
-            current_idx = 1 # Fallback to 30 days if somehow invalid
+            current_idx = 1
         filter_row.set_selected(current_idx)
 
-        # Handle the user changing the dropdown
         def on_filter_changed(combo, param):
             idx = combo.get_selected()
             self.past_days_filter = PAST_FILTER_DAYS[idx]
             self.save_config()
-            self.load_all_events() # Instantly rebuild the UI with the new date range
+            self.load_all_events() # Re-read files because date bounds changed
 
         filter_row.connect("notify::selected", on_filter_changed)
         display_group.add(filter_row)
@@ -336,18 +364,12 @@ class MainWindow(Adw.ApplicationWindow):
 
     # --- PARSING & UI BUILDING ---
     def load_all_events(self):
-        for box in (self.past_box, self.upcoming_box, self.completed_box):
-            while child := box.get_first_child():
-                box.remove(child)
-
-        all_events = []
+        """Reads files from disk and populates the in-memory event list."""
+        self.all_parsed_events = []
         now_utc = datetime.now(timezone.utc)
         today_date = now_utc.date()
         
-        # Generate the start_date dynamically based on your settings filter!
         start_date = today_date - timedelta(days=self.past_days_filter)
-        
-        # We also widen the future window so you can see events up to a year out
         end_date = today_date + timedelta(days=365)
 
         def extract_events_from_file(filepath, is_local=False):
@@ -386,7 +408,7 @@ class MainWindow(Adw.ApplicationWindow):
                     
                     event_id = f"{summary}_{sort_key.isoformat()}"
                         
-                    all_events.append({
+                    self.all_parsed_events.append({
                         'id': event_id,
                         'summary': summary,
                         'dt': dt,
@@ -398,15 +420,35 @@ class MainWindow(Adw.ApplicationWindow):
 
         extract_events_from_file(self.cache_file, is_local=False)
         extract_events_from_file(self.local_file, is_local=True)
+        
+        # Sort chronologically once
+        self.all_parsed_events.sort(key=lambda x: x['sort_key'])
 
-        all_events.sort(key=lambda x: x['sort_key'])
+        # Now that data is loaded, draw the UI
+        self.refresh_ui()
+        self.reset_sync_button()
 
-        # --- SORTING INTO TABS ---
+    def refresh_ui(self):
+        """Filters the in-memory events and rebuilds the UI."""
+        for box in (self.past_box, self.upcoming_box, self.completed_box):
+            while child := box.get_first_child():
+                box.remove(child)
+
+        now_utc = datetime.now(timezone.utc)
+        today_date = now_utc.date()
+
         past_list = []
         upcoming_list = []
         completed_list = []
 
-        for e in all_events:
+        for e in self.all_parsed_events:
+            # Check Search Query First
+            if self.current_search_query:
+                # If the query isn't in the summary (case-insensitive), skip this event
+                if self.current_search_query not in e['summary'].lower():
+                    continue
+
+            # Sort into tabs
             if e['id'] in self.completed_ids:
                 completed_list.append(e)
             else:
@@ -425,8 +467,6 @@ class MainWindow(Adw.ApplicationWindow):
         self.render_event_group(past_list, self.past_box, empty_msg="No past uncompleted events", is_completed_tab=False)
         self.render_event_group(upcoming_list, self.upcoming_box, empty_msg="No upcoming events", is_completed_tab=False)
         self.render_event_group(completed_list, self.completed_box, empty_msg="No completed events", is_completed_tab=True)
-
-        self.reset_sync_button()
 
     def render_event_group(self, events_list, target_box, empty_msg, is_completed_tab=False):
         if not events_list:
@@ -473,7 +513,10 @@ class MainWindow(Adw.ApplicationWindow):
                     else:
                         self.completed_ids.discard(event_id)
                     self.save_completed_ids()
-                    self.load_all_events()
+                    
+                    # Because we decoupled parsing and rendering, toggling a checkbox 
+                    # is now instantaneous and doesn't require a disk read!
+                    self.refresh_ui()
 
                 check.connect("toggled", on_toggle)
                 
