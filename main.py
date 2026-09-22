@@ -62,22 +62,18 @@ class MainWindow(Adw.ApplicationWindow):
         header_bar = Adw.HeaderBar()
         toolbar_view.add_top_bar(header_bar)
 
-        # Left side: Add Event Button
         self.add_button = Gtk.Button(icon_name="list-add-symbolic")
         self.add_button.connect("clicked", self.on_add_clicked)
         header_bar.pack_start(self.add_button)
 
-        # Left side: Search Toggle Button
         self.search_toggle = Gtk.ToggleButton(icon_name="system-search-symbolic")
         header_bar.pack_start(self.search_toggle)
 
-        # Right side: Sync Button
         self.sync_button = Gtk.Button(label="Sync")
         self.sync_button.add_css_class("suggested-action")
         self.sync_button.connect("clicked", self.on_sync_clicked)
         header_bar.pack_end(self.sync_button)
         
-        # Right side: Settings Button
         self.settings_button = Gtk.Button(icon_name="preferences-system-symbolic")
         self.settings_button.connect("clicked", self.on_settings_clicked)
         header_bar.pack_end(self.settings_button)
@@ -88,18 +84,13 @@ class MainWindow(Adw.ApplicationWindow):
         self.search_bar.set_child(self.search_entry)
         self.search_bar.connect_entry(self.search_entry)
         
-        # Bind the search bar visibility to the toggle button
         self.search_bar.bind_property(
             "search-mode-enabled", 
             self.search_toggle, 
             "active", 
             Gio.BindingFlags.BIDIRECTIONAL | Gio.BindingFlags.SYNC_CREATE
         )
-        
-        # Trigger UI refresh instantly when typing
         self.search_entry.connect("search-changed", self.on_search_changed)
-        
-        # Add the search bar as a secondary top bar under the header
         toolbar_view.add_top_bar(self.search_bar)
 
         # --- TAB NAVIGATION (Adw.ViewStack) ---
@@ -193,7 +184,6 @@ class MainWindow(Adw.ApplicationWindow):
 
     # --- SEARCH LOGIC ---
     def on_search_changed(self, entry):
-        # Save query in lowercase for case-insensitive matching
         self.current_search_query = entry.get_text().strip().lower()
         self.refresh_ui()
 
@@ -229,7 +219,7 @@ class MainWindow(Adw.ApplicationWindow):
             idx = combo.get_selected()
             self.past_days_filter = PAST_FILTER_DAYS[idx]
             self.save_config()
-            self.load_all_events() # Re-read files because date bounds changed
+            self.load_all_events() 
 
         filter_row.connect("notify::selected", on_filter_changed)
         display_group.add(filter_row)
@@ -293,8 +283,12 @@ class MainWindow(Adw.ApplicationWindow):
                 year, month, day = gdate.get_year(), gdate.get_month(), gdate.get_day_of_month()
                 hour, minute = hour_spin.get_value_as_int(), min_spin.get_value_as_int()
                 
-                event_dt = datetime(year, month, day, hour, minute).astimezone()
-                self.save_local_event(title, event_dt, category_str)
+                # --- FIX 1: Enforce strict timezone translation ---
+                # Create the time assuming it is the device's local time, then force it to UTC
+                local_dt = datetime(year, month, day, hour, minute)
+                utc_dt = local_dt.astimezone(timezone.utc)
+                
+                self.save_local_event(title, utc_dt, category_str)
 
         dialog.connect("response", on_response)
         dialog.present()
@@ -312,7 +306,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         event = Event()
         event.add('summary', title)
-        event.add('dtstart', event_dt)
+        event.add('dtstart', event_dt) # Now strictly saving as UTC
         event.add('categories', category_str) 
         cal.add_component(event)
 
@@ -364,7 +358,6 @@ class MainWindow(Adw.ApplicationWindow):
 
     # --- PARSING & UI BUILDING ---
     def load_all_events(self):
-        """Reads files from disk and populates the in-memory event list."""
         self.all_parsed_events = []
         now_utc = datetime.now(timezone.utc)
         today_date = now_utc.date()
@@ -401,8 +394,11 @@ class MainWindow(Adw.ApplicationWindow):
                             
                     icon_name = CATEGORY_MAP.get(category, CATEGORY_MAP["Default"])
 
+                    # --- FIX 2: Standardize all datetimes to UTC before saving to memory ---
                     if isinstance(dt, datetime):
-                        sort_key = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                        # If a legacy event is somehow loaded without timezone info (naive), 
+                        # force it into UTC so Python doesn't throw comparison errors later
+                        sort_key = dt if dt.tzinfo else dt.astimezone(timezone.utc)
                     else:
                         sort_key = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
                     
@@ -412,7 +408,7 @@ class MainWindow(Adw.ApplicationWindow):
                         'id': event_id,
                         'summary': summary,
                         'dt': dt,
-                        'sort_key': sort_key,
+                        'sort_key': sort_key, # sort_key is now strictly UTC
                         'icon_name': icon_name
                     })
             except Exception as e:
@@ -421,43 +417,38 @@ class MainWindow(Adw.ApplicationWindow):
         extract_events_from_file(self.cache_file, is_local=False)
         extract_events_from_file(self.local_file, is_local=True)
         
-        # Sort chronologically once
         self.all_parsed_events.sort(key=lambda x: x['sort_key'])
-
-        # Now that data is loaded, draw the UI
         self.refresh_ui()
         self.reset_sync_button()
 
     def refresh_ui(self):
-        """Filters the in-memory events and rebuilds the UI."""
         for box in (self.past_box, self.upcoming_box, self.completed_box):
             while child := box.get_first_child():
                 box.remove(child)
 
         now_utc = datetime.now(timezone.utc)
-        today_date = now_utc.date()
+        today_local = datetime.now().date() # Need LOCAL today for all-day events
 
         past_list = []
         upcoming_list = []
         completed_list = []
 
         for e in self.all_parsed_events:
-            # Check Search Query First
             if self.current_search_query:
-                # If the query isn't in the summary (case-insensitive), skip this event
                 if self.current_search_query not in e['summary'].lower():
                     continue
 
-            # Sort into tabs
             if e['id'] in self.completed_ids:
                 completed_list.append(e)
             else:
                 dt = e['dt']
+                # --- FIX 3: Compare apples to apples ---
                 if isinstance(dt, datetime):
-                    event_time = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-                    is_past = event_time < now_utc
+                    # Compare strict UTC event time against strict UTC current clock
+                    is_past = e['sort_key'] < now_utc
                 else:
-                    is_past = dt < today_date
+                    # All-day events must be compared against the local date
+                    is_past = dt < today_local
                 
                 if is_past:
                     past_list.append(e)
@@ -479,7 +470,13 @@ class MainWindow(Adw.ApplicationWindow):
         grouped = {}
         for event in events_list:
             dt = event['dt']
-            event_date = dt.date() if isinstance(dt, datetime) else dt
+            # --- FIX 4: Revert UTC back to local timezone for the UI headers ---
+            if isinstance(dt, datetime):
+                local_dt = dt.astimezone() if dt.tzinfo else dt
+                event_date = local_dt.date()
+            else:
+                event_date = dt
+                
             date_label = event_date.strftime("%A, %B %d")
             
             if date_label not in grouped:
@@ -498,7 +495,12 @@ class MainWindow(Adw.ApplicationWindow):
             
             for event in events_on_day:
                 dt = event['dt']
-                time_str = dt.strftime("%H:%M") if isinstance(dt, datetime) else "All Day"
+                # --- FIX 5: Revert UTC back to local timezone for row hours ---
+                if isinstance(dt, datetime):
+                    local_dt = dt.astimezone() if dt.tzinfo else dt
+                    time_str = local_dt.strftime("%H:%M")
+                else:
+                    time_str = "All Day"
                     
                 row = Adw.ActionRow(title=event['summary'], subtitle=time_str)
                 
@@ -513,9 +515,6 @@ class MainWindow(Adw.ApplicationWindow):
                     else:
                         self.completed_ids.discard(event_id)
                     self.save_completed_ids()
-                    
-                    # Because we decoupled parsing and rendering, toggling a checkbox 
-                    # is now instantaneous and doesn't require a disk read!
                     self.refresh_ui()
 
                 check.connect("toggled", on_toggle)
