@@ -32,6 +32,143 @@ PAST_FILTER_OPTIONS = ["Last 7 Days", "Last 30 Days", "Last 90 Days", "Last Year
 PAST_FILTER_DAYS = [7, 30, 90, 365, 3650] 
 
 
+# --- FULL-SCREEN EVENT EDITOR ---
+class EventEditorWindow(Adw.Window):
+    def __init__(self, parent, event=None, on_save_cb=None, on_delete_cb=None, **kwargs):
+        super().__init__(parent=parent, modal=True, **kwargs)
+        self.set_default_size(360, 720)
+        
+        # Force the window to take up the full screen on Phosh
+        self.maximize()
+
+        self.event = event
+        self.on_save_cb = on_save_cb
+        self.on_delete_cb = on_delete_cb
+
+        # Setup Header and Toolbar
+        toolbar_view = Adw.ToolbarView()
+        self.set_content(toolbar_view)
+
+        header_bar = Adw.HeaderBar()
+        toolbar_view.add_top_bar(header_bar)
+        
+        # Native window title
+        self.set_title("New Event" if not event else "Edit Event")
+
+        # Cancel Button
+        cancel_btn = Gtk.Button(label="Cancel")
+        cancel_btn.connect("clicked", self.on_cancel)
+        header_bar.pack_start(cancel_btn)
+
+        # Save Button
+        save_btn = Gtk.Button(label="Save")
+        save_btn.add_css_class("suggested-action")
+        save_btn.connect("clicked", self.on_save)
+        header_bar.pack_end(save_btn)
+
+        # Main Scrollable Content Area
+        scrolled_window = Gtk.ScrolledWindow(vexpand=True)
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        vbox.set_margin_top(24)
+        vbox.set_margin_bottom(24)
+        vbox.set_margin_start(16)
+        vbox.set_margin_end(16)
+        
+        scrolled_window.set_child(vbox)
+        toolbar_view.set_content(scrolled_window)
+
+        # 1. Title Input
+        self.title_entry = Gtk.Entry(placeholder_text="Event Title (e.g., Dentist)")
+        vbox.append(self.title_entry)
+
+        # 2. Category Dropdown
+        category_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        category_box.set_halign(Gtk.Align.CENTER)
+        category_box.append(Gtk.Label(label="Category:"))
+        
+        self.category_dropdown = Gtk.DropDown.new_from_strings(CATEGORIES_LIST)
+        category_box.append(self.category_dropdown)
+        vbox.append(category_box)
+
+        # 3. Native Calendar Widget
+        self.calendar = Gtk.Calendar()
+        self.calendar.set_halign(Gtk.Align.CENTER)
+        vbox.append(self.calendar)
+
+        # 4. Time Pickers
+        time_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        time_box.set_halign(Gtk.Align.CENTER)
+        time_box.append(Gtk.Label(label="Time (24h):"))
+
+        self.adj_hour = Gtk.Adjustment(lower=0, upper=23, step_increment=1)
+        self.hour_spin = Gtk.SpinButton(adjustment=self.adj_hour, numeric=True, orientation=Gtk.Orientation.VERTICAL)
+        time_box.append(self.hour_spin)
+
+        time_box.append(Gtk.Label(label=":"))
+
+        self.adj_min = Gtk.Adjustment(lower=0, upper=59, step_increment=5)
+        self.min_spin = Gtk.SpinButton(adjustment=self.adj_min, numeric=True, orientation=Gtk.Orientation.VERTICAL)
+        time_box.append(self.min_spin)
+
+        vbox.append(time_box)
+
+        # 5. Populate Data (If Editing)
+        if event:
+            self.title_entry.set_text(event['summary_original'])
+            try:
+                idx = CATEGORIES_LIST.index(event['category_raw'])
+            except ValueError:
+                idx = 0
+            self.category_dropdown.set_selected(idx)
+
+            dt_orig = event['dt_original']
+            local_dt = dt_orig.astimezone() if isinstance(dt_orig, datetime) and dt_orig.tzinfo else dt_orig
+            
+            # Set the calendar date
+            gdate = GLib.DateTime.new_local(local_dt.year, local_dt.month, local_dt.day, 0, 0, 0)
+            self.calendar.select_day(gdate)
+            
+            # Set the time
+            if isinstance(dt_orig, datetime):
+                self.adj_hour.set_value(local_dt.hour)
+                self.adj_min.set_value(local_dt.minute)
+
+            # Destructive Delete Button
+            delete_btn = Gtk.Button(label="Delete Event")
+            delete_btn.add_css_class("destructive-action")
+            delete_btn.set_margin_top(24)
+            delete_btn.connect("clicked", self.on_delete)
+            vbox.append(delete_btn)
+        else:
+            # Default to current hour for new events
+            self.adj_hour.set_value(datetime.now().hour)
+
+    def on_cancel(self, button):
+        self.close()
+
+    def on_delete(self, button):
+        if self.on_delete_cb and self.event:
+            self.on_delete_cb(self.event)
+        self.close()
+
+    def on_save(self, button):
+        title = self.title_entry.get_text()
+        category = CATEGORIES_LIST[self.category_dropdown.get_selected()]
+
+        gdate = self.calendar.get_date()
+        year, month, day = gdate.get_year(), gdate.get_month(), gdate.get_day_of_month()
+        hour, minute = self.hour_spin.get_value_as_int(), self.min_spin.get_value_as_int()
+        
+        # Apply standard timezone conversion logic
+        local_dt = datetime(year, month, day, hour, minute)
+        utc_dt = local_dt.astimezone(timezone.utc)
+        
+        if self.on_save_cb:
+            self.on_save_cb(self.event, title, utc_dt, category)
+        self.close()
+
+
+# --- MAIN APPLICATION WINDOW ---
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -61,18 +198,15 @@ class MainWindow(Adw.ApplicationWindow):
         header_bar = Adw.HeaderBar()
         toolbar_view.add_top_bar(header_bar)
 
-        # Left side: Add Event Button
         self.add_button = Gtk.Button(icon_name="list-add-symbolic")
         self.add_button.connect("clicked", self.on_add_clicked)
         header_bar.pack_start(self.add_button)
 
-        # Right side: Sync Button
         self.sync_button = Gtk.Button(label="Sync")
         self.sync_button.add_css_class("suggested-action")
         self.sync_button.connect("clicked", self.on_sync_clicked)
         header_bar.pack_end(self.sync_button)
         
-        # Right side: Settings Button
         self.settings_button = Gtk.Button(icon_name="preferences-system-symbolic")
         self.settings_button.connect("clicked", self.on_settings_clicked)
         header_bar.pack_end(self.settings_button)
@@ -207,7 +341,11 @@ class MainWindow(Adw.ApplicationWindow):
         pref_window.add(page)
         pref_window.present()
 
-    # --- ROW CLICK / EDIT LOGIC ---
+    # --- NEW: FULL-SCREEN ROUTING ---
+    def on_add_clicked(self, button):
+        editor = EventEditorWindow(parent=self, event=None, on_save_cb=self.save_or_update_event)
+        editor.present()
+
     def on_row_activated(self, listbox, row):
         event = getattr(row, '_event_data', None)
         if not event: return
@@ -221,199 +359,23 @@ class MainWindow(Adw.ApplicationWindow):
             dialog.add_response("close", "Close")
             dialog.present()
             return
-
-        # Build Edit Dialog for Local Events
-        dialog = Adw.MessageDialog(
-            parent=self, 
-            heading="Edit Event", 
-            body="Update or remove this local event."
-        )
-        dialog.add_response("cancel", "Cancel")
-        dialog.add_response("delete", "Delete")
-        dialog.add_response("save", "Save")
-        
-        # Style the buttons properly
-        dialog.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
-        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
-
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        
-        title_entry = Gtk.Entry()
-        title_entry.set_text(event['summary_original'])
-        vbox.append(title_entry)
-        
-        category_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        category_box.set_halign(Gtk.Align.CENTER)
-        category_box.append(Gtk.Label(label="Category:"))
-        
-        category_dropdown = Gtk.DropDown.new_from_strings(CATEGORIES_LIST)
-        try:
-            idx = CATEGORIES_LIST.index(event['category_raw'])
-        except ValueError:
-            idx = 0
-        category_dropdown.set_selected(idx)
-        category_box.append(category_dropdown)
-        vbox.append(category_box)
-
-        calendar = Gtk.Calendar()
-        dt_orig = event['dt_original']
-        
-        if isinstance(dt_orig, datetime):
-            local_dt = dt_orig.astimezone() if dt_orig.tzinfo else dt_orig
-        else:
-            local_dt = dt_orig
             
-        gdate = GLib.DateTime.new_local(local_dt.year, local_dt.month, local_dt.day, 0, 0, 0)
-        calendar.select_day(gdate)
-        vbox.append(calendar)
+        editor = EventEditorWindow(parent=self, event=event, on_save_cb=self.save_or_update_event, on_delete_cb=self.delete_event)
+        editor.present()
 
-        time_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        time_box.set_halign(Gtk.Align.CENTER)
-        time_box.append(Gtk.Label(label="Time (24h):"))
-
-        current_hour = local_dt.hour if isinstance(dt_orig, datetime) else 0
-        current_min = local_dt.minute if isinstance(dt_orig, datetime) else 0
-        
-        adj_hour = Gtk.Adjustment(value=current_hour, lower=0, upper=23, step_increment=1)
-        hour_spin = Gtk.SpinButton(adjustment=adj_hour, numeric=True, orientation=Gtk.Orientation.VERTICAL)
-        time_box.append(hour_spin)
-
-        time_box.append(Gtk.Label(label=":"))
-
-        adj_min = Gtk.Adjustment(value=current_min, lower=0, upper=59, step_increment=5)
-        min_spin = Gtk.SpinButton(adjustment=adj_min, numeric=True, orientation=Gtk.Orientation.VERTICAL)
-        time_box.append(min_spin)
-
-        vbox.append(time_box)
-        dialog.set_extra_child(vbox)
-
-        def on_response(dialog, response):
-            if response == "delete":
-                self.update_local_event(event, delete=True)
-            elif response == "save":
-                new_title = title_entry.get_text()
-                selected_idx = category_dropdown.get_selected()
-                new_category = CATEGORIES_LIST[selected_idx]
-
-                gdate = calendar.get_date()
-                year, month, day = gdate.get_year(), gdate.get_month(), gdate.get_day_of_month()
-                hour, minute = hour_spin.get_value_as_int(), min_spin.get_value_as_int()
-                
-                new_local_dt = datetime(year, month, day, hour, minute)
-                new_utc_dt = new_local_dt.astimezone(timezone.utc)
-                
-                self.update_local_event(event, new_title, new_utc_dt, new_category, delete=False)
-
-        dialog.connect("response", on_response)
-        dialog.present()
-
-    def update_local_event(self, old_event, new_title=None, new_dt=None, new_category=None, delete=False):
-        if not os.path.exists(self.local_file):
-            return
-            
-        try:
-            with open(self.local_file, 'rb') as f:
-                cal = Calendar.from_ical(f.read())
-                
-            found_idx = -1
-            # Search through the .ics file to find the exact matching event block
-            for i, component in enumerate(cal.subcomponents):
-                if component.name == 'VEVENT':
-                    c_summary = str(component.get('summary', ''))
-                    c_dtstart = component.get('dtstart')
-                    if c_dtstart and c_dtstart.dt == old_event['dt_original'] and c_summary == old_event['summary_original']:
-                        found_idx = i
-                        break
-                        
-            if found_idx != -1:
-                if delete:
-                    del cal.subcomponents[found_idx]
-                else:
-                    comp = cal.subcomponents[found_idx]
-                    # Remove old properties before adding the new ones
-                    del comp['summary']
-                    del comp['dtstart']
-                    if 'categories' in comp:
-                        del comp['categories']
-                        
-                    comp.add('summary', new_title)
-                    comp.add('dtstart', new_dt)
-                    comp.add('categories', new_category)
-                    
-                with open(self.local_file, 'wb') as f:
-                    f.write(cal.to_ical())
-                    
-                self.load_all_events() # Rebuild the UI from the fresh file
-                
-        except Exception as e:
-            print(f"Error updating local event: {e}")
-
-    # --- ADD EVENT DIALOG ---
-    def on_add_clicked(self, button):
-        dialog = Adw.MessageDialog(
-            parent=self, 
-            heading="New Local Event", 
-            body="Select details for your new event."
-        )
-        dialog.add_response("cancel", "Cancel")
-        dialog.add_response("add", "Add Event")
-        dialog.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
-
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        
-        title_entry = Gtk.Entry(placeholder_text="Event Title (e.g., Dentist)")
-        vbox.append(title_entry)
-        
-        category_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        category_box.set_halign(Gtk.Align.CENTER)
-        category_box.append(Gtk.Label(label="Category:"))
-        
-        category_dropdown = Gtk.DropDown.new_from_strings(CATEGORIES_LIST)
-        category_box.append(category_dropdown)
-        vbox.append(category_box)
-
-        calendar = Gtk.Calendar()
-        vbox.append(calendar)
-
-        time_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        time_box.set_halign(Gtk.Align.CENTER)
-        time_box.append(Gtk.Label(label="Time (24h):"))
-
-        current_hour = datetime.now().hour
-        adj_hour = Gtk.Adjustment(value=current_hour, lower=0, upper=23, step_increment=1)
-        hour_spin = Gtk.SpinButton(adjustment=adj_hour, numeric=True, orientation=Gtk.Orientation.VERTICAL)
-        time_box.append(hour_spin)
-
-        time_box.append(Gtk.Label(label=":"))
-
-        adj_min = Gtk.Adjustment(value=0, lower=0, upper=59, step_increment=5)
-        min_spin = Gtk.SpinButton(adjustment=adj_min, numeric=True, orientation=Gtk.Orientation.VERTICAL)
-        time_box.append(min_spin)
-
-        vbox.append(time_box)
-        dialog.set_extra_child(vbox)
-
-        def on_response(dialog, response):
-            if response == "add":
-                title = title_entry.get_text()
-                selected_idx = category_dropdown.get_selected()
-                category_str = CATEGORIES_LIST[selected_idx]
-
-                gdate = calendar.get_date()
-                year, month, day = gdate.get_year(), gdate.get_month(), gdate.get_day_of_month()
-                hour, minute = hour_spin.get_value_as_int(), min_spin.get_value_as_int()
-                
-                local_dt = datetime(year, month, day, hour, minute)
-                utc_dt = local_dt.astimezone(timezone.utc)
-                
-                self.save_local_event(title, utc_dt, category_str)
-
-        dialog.connect("response", on_response)
-        dialog.present()
-
-    def save_local_event(self, title, event_dt, category_str):
+    # --- EVENT DATA MANAGEMENT ---
+    def save_or_update_event(self, old_event, title, dt, category):
         if not title: return
 
+        if old_event:
+            self.update_local_event(old_event, new_title=title, new_dt=dt, new_category=category, delete=False)
+        else:
+            self.save_local_event(title, dt, category)
+
+    def delete_event(self, old_event):
+        self.update_local_event(old_event, delete=True)
+
+    def save_local_event(self, title, event_dt, category_str):
         cal = Calendar()
         if os.path.exists(self.local_file):
             with open(self.local_file, 'rb') as f:
@@ -432,6 +394,46 @@ class MainWindow(Adw.ApplicationWindow):
             f.write(cal.to_ical())
 
         self.load_all_events()
+
+    def update_local_event(self, old_event, new_title=None, new_dt=None, new_category=None, delete=False):
+        if not os.path.exists(self.local_file):
+            return
+            
+        try:
+            with open(self.local_file, 'rb') as f:
+                cal = Calendar.from_ical(f.read())
+                
+            found_idx = -1
+            for i, component in enumerate(cal.subcomponents):
+                if component.name == 'VEVENT':
+                    c_summary = str(component.get('summary', ''))
+                    c_dtstart = component.get('dtstart')
+                    if c_dtstart and c_dtstart.dt == old_event['dt_original'] and c_summary == old_event['summary_original']:
+                        found_idx = i
+                        break
+                        
+            if found_idx != -1:
+                if delete:
+                    del cal.subcomponents[found_idx]
+                else:
+                    comp = cal.subcomponents[found_idx]
+                    del comp['summary']
+                    del comp['dtstart']
+                    if 'categories' in comp:
+                        del comp['categories']
+                        
+                    comp.add('summary', new_title)
+                    comp.add('dtstart', new_dt)
+                    comp.add('categories', new_category)
+                    
+                with open(self.local_file, 'wb') as f:
+                    f.write(cal.to_ical())
+                    
+                self.load_all_events()
+                
+        except Exception as e:
+            print(f"Error updating local event: {e}")
+
 
     # --- SYNC LOGIC ---
     def on_sync_clicked(self, button):
@@ -524,13 +526,13 @@ class MainWindow(Adw.ApplicationWindow):
                     self.all_parsed_events.append({
                         'id': event_id,
                         'summary': summary,
-                        'summary_original': summary_original, # Track original for editing
+                        'summary_original': summary_original, 
                         'dt': dt_original,
-                        'dt_original': dt_original,           # Track original for finding it in .ics
+                        'dt_original': dt_original,          
                         'sort_key': sort_key,
                         'icon_name': icon_name,
                         'category_raw': category,
-                        'is_local': is_local                  # Flag so we know if we are allowed to edit it
+                        'is_local': is_local                  
                     })
             except Exception as e:
                 print(f"Error reading {filepath}: {e}")
@@ -603,11 +605,9 @@ class MainWindow(Adw.ApplicationWindow):
             label.set_margin_bottom(6)
             
             day_list = Gtk.ListBox()
-            # Allow items to be selected/clicked so we can edit them
             day_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
             day_list.add_css_class("boxed-list")
             
-            # Connect the click event for the whole list block
             day_list.connect("row-activated", self.on_row_activated)
             
             for event in events_on_day:
@@ -619,10 +619,8 @@ class MainWindow(Adw.ApplicationWindow):
                     time_str = "All Day"
                     
                 row = Adw.ActionRow(title=event['summary'], subtitle=time_str)
-                row.set_activatable(True) # Make row emit signals
+                row.set_activatable(True) 
                 
-                # Attach the raw dictionary directly to the row UI object 
-                # so we know EXACTLY what data this row is referencing when clicked.
                 row._event_data = event
                 
                 prefix_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
